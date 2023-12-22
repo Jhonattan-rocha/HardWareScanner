@@ -7,15 +7,50 @@ import time
 
 import GPUtil
 import psutil
+from PySide6.QtCore import QObject, Signal, Slot, QThread, QTimer
 from PySide6.QtWidgets import QApplication, QWidget, QGroupBox
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QLineEdit, QLabel
-from PySide6.QtCore import QTimer
 
 # Important:
 # You need to run the following command to generate the ui_form.py file
 #     pyside6-uic form.ui -o ui_form.py, or
 #     pyside2-uic form.ui -o ui_form.py
 from ui_form import Ui_Widget
+
+
+class Worker(QObject):
+    finished = Signal()
+    update_ui_proc = Signal(psutil.Process)
+    clear_list = Signal()
+
+    def __init__(self, ui, parent=None):
+        super().__init__(parent)
+        self._running = True
+        self.ui = ui
+
+    @Slot()
+    def processar(self):
+        self.clear_list.emit()
+        try:
+            processos = psutil.process_iter()
+
+            for proc in processos:
+                try:
+                    if proc.pid == 0:
+                        continue
+
+                    self.update_ui_proc.emit(proc)
+
+                except (psutil.AccessDenied, psutil.NoSuchProcess) as err:
+                    print(f"Erro ao acessar informações do processo: {err}")
+                    continue
+                except Exception as e:
+                    print(e)
+                    continue
+        except Exception as e:
+            print(e)
+
+        self.finished.emit()
 
 
 class Widget(QWidget):
@@ -25,9 +60,22 @@ class Widget(QWidget):
         self.ui.setupUi(self)
         self._running = True
         self.ui.atualizarprocess.clicked.connect(self.atualizar_processos)
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.atualizar_processos)
-        self.timer.start(20000)
+        # self.timer = QTimer(self)
+        # self.timer.timeout.connect(self.atualizar_processos)
+        # self.timer.start(20000)
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.init_process)
+        self.timer.start(10000)
+
+    def init_process(self):
+        self.worker = Worker(self.ui)
+        self.workerThread = QThread()
+        self.worker.moveToThread(self.workerThread)
+        self.worker.finished.connect(self.workerThread.quit)
+        self.worker.update_ui_proc.connect(self.atualizar_interface)
+        self.worker.clear_list.connect(self.limpar_scroll_area)
+        self.workerThread.started.connect(self.worker.processar)  # Inicia o processamento quando a thread é iniciada
+        self.workerThread.start()
 
     def preencher_so(self):
         self.ui.soname.setText(platform.system())
@@ -104,11 +152,11 @@ class Widget(QWidget):
 
     def update_ui(self):
         self.ui.GPUs.update()  # Atualize o layout para refletir as alterações
-        self.repaint()  # Redesenha a janela para mostrar as atualizações
+        # self.repaint()  # Redesenha a janela para mostrar as atualizações
 
     def update_ui_process(self):
         self.ui.scrollProcessos.update()
-        self.repaint()
+        # self.repaint()
 
     def preencher_gpus(self):
         # Colocando as GPUs
@@ -187,7 +235,7 @@ class Widget(QWidget):
             self.update_ui()  # Chame o método para atualizar a interface
 
     def atualizar_processos(self):
-        self.limpar_scroll_area()  # Limpa os widgets antigos
+        threading.Thread(target=self.limpar_scroll_area, args=()).start()  # Limpa os widgets antigos
 
         processos = psutil.process_iter()
 
@@ -201,6 +249,9 @@ class Widget(QWidget):
 
             except (psutil.AccessDenied, psutil.NoSuchProcess) as err:
                 print(f"Erro ao acessar informações do processo: {err}")
+                continue
+            except Exception as e:
+                print(e)
                 continue
 
         self.update_ui_process()
@@ -279,6 +330,11 @@ class Widget(QWidget):
         hbox_layout.addLayout(field5_layout)
 
         return group_box
+
+    def atualizar_interface(self, widget_processo):
+        element = self.criar_widget_processo(widget_processo)
+        self.ui.scrollProcessos.addWidget(element)
+        self.update_ui_process()
 
 
 if __name__ == "__main__":
