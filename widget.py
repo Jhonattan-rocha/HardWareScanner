@@ -4,10 +4,10 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import GPUtil
 import psutil
-from PySide6.QtCore import QObject, Signal, Slot, QThread, QTimer
 from PySide6.QtWidgets import QApplication, QWidget, QGroupBox
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QLineEdit, QLabel
 
@@ -18,74 +18,6 @@ from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QLineEdit, QLabel
 from ui_form import Ui_Widget
 
 
-class Worker(QObject):
-    finished = Signal()
-    update_ui_proc = Signal(psutil.Process)
-
-    def __init__(self, ui, parent=None):
-        super().__init__(parent)
-        self.running = True
-        self.ui = ui
-
-    @Slot()
-    def processar(self):
-        # self.clear_list.emit()
-        try:
-            processos = psutil.process_iter()
-
-            for proc in processos:
-                try:
-                    if proc.pid == 0:
-                        continue
-                    self.update_ui_proc.emit(proc)
-                except (psutil.AccessDenied, psutil.NoSuchProcess) as err:
-                    print(f"Erro ao acessar informações do processo: {err}")
-                    continue
-                except Exception as e:
-                    print(e)
-                    continue
-        except Exception as e:
-            print(e)
-
-        self.finished.emit()
-
-
-class Updater(QObject):
-    finished = Signal()
-    remove_item = Signal(QGroupBox)
-    running = True
-    pai = None
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-
-    @Slot()
-    def run(self, pid: int, group: QGroupBox, fields: dict):
-
-        while self.running:
-            process = psutil.process_iter()
-
-            proc = [proc for proc in process if proc.pid == pid][0]
-            try:
-                if proc.pid == pid:
-                    fields['name'].setText(proc.name())
-                    fields['cpu_percent'].setText(f'{proc.cpu_percent():.2f}%')
-                    fields['memory_percent'].setText(f'{proc.memory_percent():.2f} MB')
-                    fields['status'].setText(proc.status())
-                    fields['exe'].setText(proc.exe())
-            except Exception as e:
-                self.pai.processos.remove(proc.pid)
-                self.remove_item.emit(group, proc.pid)
-                break
-
-            time.sleep(1)
-        self.finished.emit()
-
-    @staticmethod
-    def stop_threads():
-        Updater.running = False
-
-
 class Widget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -93,20 +25,13 @@ class Widget(QWidget):
         self.ui.setupUi(self)
         self.running = True
         self.ui.atualizarprocess.clicked.connect(self.atualizar_processos)
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.init_process)
-        self.timer.start(10000)
-        self.processos: list[int] = []
-        Updater.pai = self
+        # self.timer = QTimer()
+        # self.timer.timeout.connect(self.atualizar_processos)
+        # self.timer.start(5000)
+        self.semaforo = threading.Semaphore(1)
+        self.thread_pool = ThreadPoolExecutor()
 
-    def init_process(self):
-        self.worker = Worker(self.ui)
-        self.workerThread = QThread()
-        self.worker.moveToThread(self.workerThread)
-        self.worker.finished.connect(self.workerThread.quit)
-        self.worker.update_ui_proc.connect(self.atualizar_interface)
-        self.workerThread.started.connect(self.worker.processar)  # Inicia o processamento quando a thread é iniciada
-        self.workerThread.start()
+        self.processos: list[int] = []
 
     def preencher_so(self):
         self.ui.soname.setText(platform.system())
@@ -183,7 +108,7 @@ class Widget(QWidget):
 
     def update_ui(self):
         self.ui.GPUs.update()  # Atualize o layout para refletir as alterações
-        # self.repaint()  # Redesenha a janela para mostrar as atualizações
+        self.repaint()  # Redesenha a janela para mostrar as atualizações
 
     def update_ui_process(self):
         self.ui.scrollProcessos.update()
@@ -266,24 +191,9 @@ class Widget(QWidget):
             self.update_ui()  # Chame o método para atualizar a interface
 
     def atualizar_processos(self):
-        threading.Thread(target=self.limpar_scroll_area, args=()).start()  # Limpa os widgets antigos
+        self.limpar_scroll_area()  # Limpa os widgets antigos
 
-        processos = psutil.process_iter()
-
-        for proc in processos:
-            try:
-                if proc.pid == 0:
-                    continue
-
-                widget_processo, fields = self.criar_widget_processo(proc)
-                self.ui.scrollProcessos.addWidget(widget_processo)
-
-            except (psutil.AccessDenied, psutil.NoSuchProcess) as err:
-                print(f"Erro ao acessar informações do processo: {err}")
-                continue
-            except Exception as e:
-                print(e)
-                continue
+        self.get_process_data()
 
         self.update_ui_process()
 
@@ -291,6 +201,8 @@ class Widget(QWidget):
         # Obtém o layout da QScrollArea
         scroll_layout = self.ui.scrollProcessos.layout()
         self.processos.clear()
+        self.thread_pool.shutdown(wait=False)
+        self.thread_pool = ThreadPoolExecutor()
 
         # Remove todos os widgets filhos
         while scroll_layout.count():
@@ -303,8 +215,8 @@ class Widget(QWidget):
                 # Se o item não for um widget, deleta o item diretamente
                 del item
 
-    def criar_widget_processo(self, proc):
-        group_box = QGroupBox(f'Processo: {proc.name()}')
+    def criar_widget_processo(self, proc: psutil.Process):
+        group_box = QGroupBox(f'Processo: {proc.pid}')
 
         hbox_layout = QHBoxLayout()
         group_box.setLayout(hbox_layout)
@@ -322,7 +234,7 @@ class Widget(QWidget):
         field2_layout = QVBoxLayout()
         label2 = QLabel('CPU %')
         line_edit2 = QLineEdit()
-        line_edit2.setText(f"{proc.cpu_percent()}")
+        line_edit2.setText(f"{proc.cpu_percent(1)}%")
         line_edit2.setReadOnly(True)
         field2_layout.addWidget(label2)
         field2_layout.addWidget(line_edit2)
@@ -332,7 +244,7 @@ class Widget(QWidget):
         label3 = QLabel('Memória %')
         line_edit3 = QLineEdit()
         line_edit3.setReadOnly(True)
-        line_edit3.setText(f"{proc.memory_percent()}")
+        line_edit3.setText(f"{proc.memory_percent()}%")
         field3_layout.addWidget(label3)
         field3_layout.addWidget(line_edit3)
 
@@ -375,45 +287,67 @@ class Widget(QWidget):
             widget.setParent(None)
             widget.deleteLater()
 
-    def atualizar_interface(self, widget_processo):
+    def create_process(self, widget_processo):
         try:
             if widget_processo.pid not in self.processos:
                 self.processos.append(widget_processo.pid)
                 element, fields = self.criar_widget_processo(widget_processo)
                 self.ui.scrollProcessos.addWidget(element)
-
-                # Criar instâncias separadas de Updater e QThread para cada processo
-                updater = Updater()
-                thread = QThread()
-                self.thread().children().append(thread)
-
-                updater.moveToThread(thread)
-                updater.finished.connect(lambda: self.cleanup_thread(thread, updater))  # Conectar uma vez só
-                updater.remove_item.connect(lambda x: self.remover_elemento(x, widget_processo.pid))
-
-                # Connect the signal to start the updater
-                thread.started.connect(lambda: updater.run(widget_processo.pid, element, fields))
-
-                # Iniciar a thread
-                # thread.start()
+                self.thread_pool.submit(
+                    lambda pid=widget_processo.pid, el=element, f=fields: self.update_process(pid, el, f))
         except Exception as e:
             print(f"Erro ao atualizar a interface: {e}")
 
-    def cleanup_thread(self, thread, updater):
+    def update_process(self, pid: int, group: QGroupBox, fields: dict):
+        while self.running:
+            process = psutil.process_iter()
+            print("Atualizando processo: ", pid)
+
+            proc = [proc for proc in process if proc.pid == pid][0]
+            try:
+                if proc.pid == pid:
+                    self.semaforo.acquire()
+                    fields['name'].setText(proc.name())
+                    fields['cpu_percent'].setText(f'{proc.cpu_percent(1):.2f}%')
+                    fields['memory_percent'].setText(f'{proc.memory_percent():.2f}%')
+                    fields['status'].setText(proc.status())
+                    fields['exe'].setText(proc.exe())
+            except Exception as e:
+                print(e)
+                self.processos.remove(proc.pid)
+                self.remover_elemento(group, proc.pid)
+                break
+            finally:
+                self.semaforo.release()
+                pass
+
+            group.update()
+
+            time.sleep(5)
+
+    def get_process_data(self):
         try:
-            if thread.isRunning():
-                thread.quit()
-                thread.wait()
-            updater.deleteLater()
-            thread.deleteLater()
+            processos = psutil.process_iter()
+
+            for proc in processos:
+                try:
+                    if proc.pid == 0:
+                        continue
+                    self.create_process(proc)
+                except (psutil.AccessDenied, psutil.NoSuchProcess) as err:
+                    print(f"Erro ao acessar informações do processo: {err}")
+                    continue
+                except Exception as e:
+                    print(e)
+                    continue
         except Exception as e:
-            print(f"Erro ao limpar thread e updater: {e}")
+            print(e)
 
     def closeEvent(self, event):
         # Sinalize para encerrar threads aqui
         # Emita um sinal para que as threads parem
-        Updater.stop_threads()
         self.running = False
+        self.thread_pool.shutdown(wait=False, cancel_futures=True)
         event.accept()
 
 
